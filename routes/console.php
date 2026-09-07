@@ -2,6 +2,13 @@
 
 use Illuminate\Foundation\Inspiring;
 use Illuminate\Support\Facades\Artisan;
+use Illuminate\Support\Facades\Schedule;
+
+/*
+|--------------------------------------------------------------------------
+| Default Laravel Command
+|--------------------------------------------------------------------------
+*/
 
 Artisan::command('inspire', function () {
     $this->comment(Inspiring::quote());
@@ -9,9 +16,12 @@ Artisan::command('inspire', function () {
 
 /*
 |--------------------------------------------------------------------------
-| Scheduled Tasks
+| Automated Database Backup
 |--------------------------------------------------------------------------
-| This command will run daily and create database backup
+|
+| Create a daily database backup and automatically remove
+| backups older than BACKUP_RETENTION_DAYS.
+|
 */
 
-Schedule::command('database:backup')->daily();
+Schedule::command('database:backup --cleanup')->daily();
