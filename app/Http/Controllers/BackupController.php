@@ -2,17 +2,27 @@
 
 namespace App\Http\Controllers;
 
+use App\Models\BackupLog;
+use Carbon\Carbon;
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Artisan;
 use Illuminate\Support\Facades\File;
 use Symfony\Component\HttpFoundation\BinaryFileResponse;
+use Symfony\Component\HttpFoundation\StreamedResponse;
 
 class BackupController extends Controller
 {
     /**
      * Display backup management dashboard.
+     *
+     * Features:
+     * - Search
+     * - Sorting
+     * - Date filtering
+     * - Pagination
+     * - Statistics
      */
-    public function index()
+    public function index(Request $request)
     {
         $backupPath = storage_path('app/backup');
 
@@ -20,124 +30,749 @@ class BackupController extends Controller
             File::makeDirectory($backupPath, 0755, true);
         }
 
+        /*
+        |--------------------------------------------------------------------------
+        | Search
+        |--------------------------------------------------------------------------
+        */
+
+        $search = trim($request->get('search', ''));
+
+        /*
+        |--------------------------------------------------------------------------
+        | Sorting
+        |--------------------------------------------------------------------------
+        */
+
+        $sort = $request->get('sort', 'newest');
+
+        $allowedSorts = [
+            'newest',
+            'oldest',
+            'largest',
+            'smallest',
+            'name_asc',
+            'name_desc',
+        ];
+
+        if (!in_array($sort, $allowedSorts)) {
+            $sort = 'newest';
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Date Filter
+        |--------------------------------------------------------------------------
+        */
+
+        $dateFrom = $request->get('date_from');
+        $dateTo = $request->get('date_to');
+
+        /*
+        |--------------------------------------------------------------------------
+        | Read Backup Files
+        |--------------------------------------------------------------------------
+        */
+
         $files = collect(File::files($backupPath))
             ->filter(function ($file) {
                 return strtolower($file->getExtension()) === 'sql';
-            })
+            });
+
+        /*
+        |--------------------------------------------------------------------------
+        | Search Filter
+        |--------------------------------------------------------------------------
+        */
+
+        if ($search !== '') {
+            $files = $files->filter(function ($file) use ($search) {
+                return str_contains(
+                    strtolower($file->getFilename()),
+                    strtolower($search)
+                );
+            });
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Date From Filter
+        |--------------------------------------------------------------------------
+        */
+
+        if ($dateFrom) {
+            try {
+                $fromTimestamp = Carbon::parse($dateFrom)
+                    ->startOfDay()
+                    ->timestamp;
+
+                $files = $files->filter(function ($file) use ($fromTimestamp) {
+                    return $file->getMTime() >= $fromTimestamp;
+                });
+            } catch (\Throwable $e) {
+                // Ignore invalid date.
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Date To Filter
+        |--------------------------------------------------------------------------
+        */
+
+        if ($dateTo) {
+            try {
+                $toTimestamp = Carbon::parse($dateTo)
+                    ->endOfDay()
+                    ->timestamp;
+
+                $files = $files->filter(function ($file) use ($toTimestamp) {
+                    return $file->getMTime() <= $toTimestamp;
+                });
+            } catch (\Throwable $e) {
+                // Ignore invalid date.
+            }
+        }
+
+        /*
+        |--------------------------------------------------------------------------
+        | Sorting
+        |--------------------------------------------------------------------------
+        */
+
+        switch ($sort) {
+            case 'oldest':
+                $files = $files->sortBy(function ($file) {
+                    return $file->getMTime();
+                });
+                break;
+
+            case 'largest':
+                $files = $files->sortByDesc(function ($file) {
+                    return $file->getSize();
+                });
+                break;
+
+            case 'smallest':
+                $files = $files->sortBy(function ($file) {
+                    return $file->getSize();
+                });
+                break;
+
+            case 'name_asc':
+                $files = $files->sortBy(function ($file) {
+                    return strtolower($file->getFilename());
+                });
+                break;
+
+            case 'name_desc':
+                $files = $files->sortByDesc(function ($file) {
+                    return strtolower($file->getFilename());
+                });
+                break;
+
+            default:
+                $files = $files->sortByDesc(function ($file) {
+                    return $file->getMTime();
+                });
+                break;
+        }
+
+        $files = $files->values();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Statistics - ALL Backup Files
+        |--------------------------------------------------------------------------
+        */
+
+        $allFiles = collect(File::files($backupPath))
+            ->filter(function ($file) {
+                return strtolower($file->getExtension()) === 'sql';
+            });
+
+        $totalBackups = $allFiles->count();
+
+        $totalSizeBytes = $allFiles->sum(function ($file) {
+            return $file->getSize();
+        });
+
+        $latestBackup = $allFiles
             ->sortByDesc(function ($file) {
                 return $file->getMTime();
             })
+            ->first();
+
+        $oldestBackup = $allFiles
+            ->sortBy(function ($file) {
+                return $file->getMTime();
+            })
+            ->first();
+
+        /*
+        |--------------------------------------------------------------------------
+        | Pagination
+        |--------------------------------------------------------------------------
+        */
+
+        $perPage = 5;
+
+        $currentPage = max(
+            1,
+            (int) $request->get('page', 1)
+        );
+
+        $totalFiltered = $files->count();
+
+        $paginatedFiles = $files
+            ->slice(
+                ($currentPage - 1) * $perPage,
+                $perPage
+            )
             ->values();
 
-        $backups = $files->map(function ($file) {
+        $backups = $paginatedFiles->map(function ($file) {
             return [
                 'name' => $file->getFilename(),
-                'size' => $this->formatFileSize($file->getSize()),
+
+                'size' => $this->formatFileSize(
+                    $file->getSize()
+                ),
+
                 'size_bytes' => $file->getSize(),
-                'created_at' => date('Y-m-d H:i:s', $file->getMTime()),
-                'created_date' => date('d M Y', $file->getMTime()),
-                'created_time' => date('h:i A', $file->getMTime()),
+
+                'created_at' => date(
+                    'Y-m-d H:i:s',
+                    $file->getMTime()
+                ),
+
+                'created_date' => date(
+                    'd M Y',
+                    $file->getMTime()
+                ),
+
+                'created_time' => date(
+                    'h:i A',
+                    $file->getMTime()
+                ),
+
                 'age_days' => now()->diffInDays(
-                    \Carbon\Carbon::createFromTimestamp($file->getMTime())
+                    Carbon::createFromTimestamp(
+                        $file->getMTime()
+                    )
                 ),
             ];
         });
 
-        $totalBackups = $backups->count();
+        /*
+        |--------------------------------------------------------------------------
+        | Manual Pagination Object
+        |--------------------------------------------------------------------------
+        */
 
-        $totalSize = $files->sum(function ($file) {
-            return $file->getSize();
-        });
+        $pagination = new \Illuminate\Pagination\LengthAwarePaginator(
+            $backups,
+            $totalFiltered,
+            $perPage,
+            $currentPage,
+            [
+                'path' => $request->url(),
+                'query' => $request->query(),
+            ]
+        );
+
+        /*
+        |--------------------------------------------------------------------------
+        | Log Statistics
+        |--------------------------------------------------------------------------
+        */
+
+        $successfulLogs = BackupLog::where(
+            'status',
+            'success'
+        )->count();
+
+        $failedLogs = BackupLog::where(
+            'status',
+            'failed'
+        )->count();
 
         return view('backups.index', [
-            'backups' => $backups,
+            'backups' => $pagination,
+
             'totalBackups' => $totalBackups,
-            'totalSize' => $this->formatFileSize($totalSize),
-            'retentionDays' => (int) env('BACKUP_RETENTION_DAYS', 7),
+
+            'totalSize' => $this->formatFileSize(
+                $totalSizeBytes
+            ),
+
+            'retentionDays' => max(
+                1,
+                (int) env(
+                    'BACKUP_RETENTION_DAYS',
+                    7
+                )
+            ),
+
+            'latestBackup' => $latestBackup,
+
+            'oldestBackup' => $oldestBackup,
+
+            'successfulLogs' => $successfulLogs,
+
+            'failedLogs' => $failedLogs,
+
+            'search' => $search,
+
+            'sort' => $sort,
+
+            'dateFrom' => $dateFrom,
+
+            'dateTo' => $dateTo,
         ]);
     }
 
     /**
-     * Create a new database backup manually.
+     * Create backup manually.
      */
     public function create()
     {
-        $exitCode = Artisan::call('database:backup');
+        $exitCode = Artisan::call(
+            'database:backup'
+        );
 
         if ($exitCode === 0) {
             return redirect()
                 ->route('backups.index')
-                ->with('success', 'Database backup created successfully!');
+                ->with(
+                    'success',
+                    'Database backup created successfully!'
+                );
         }
 
         return redirect()
             ->route('backups.index')
-            ->with('error', 'Database backup failed. Please check the Laravel logs.');
+            ->with(
+                'error',
+                'Database backup failed. Please check the logs.'
+            );
     }
 
     /**
-     * Download a backup file.
+     * Download backup.
      */
-    public function download(string $filename): BinaryFileResponse
-    {
+    public function download(
+        string $filename
+    ): BinaryFileResponse {
         $filename = basename($filename);
 
-        if (!str_ends_with(strtolower($filename), '.sql')) {
+        if (
+            !str_ends_with(
+                strtolower($filename),
+                '.sql'
+            )
+        ) {
             abort(404);
         }
 
-        $backupPath = storage_path('app/backup/' . $filename);
+        $backupPath = storage_path(
+            'app/backup/' . $filename
+        );
 
         if (!File::exists($backupPath)) {
-            abort(404, 'Backup file not found.');
+            abort(
+                404,
+                'Backup file not found.'
+            );
         }
 
-        return response()->download($backupPath, $filename, [
-            'Content-Type' => 'application/sql',
-        ]);
+        return response()->download(
+            $backupPath,
+            $filename,
+            [
+                'Content-Type' => 'application/sql',
+            ]
+        );
     }
 
     /**
-     * Delete a backup file.
+     * Delete single backup.
      */
     public function destroy(string $filename)
     {
         $filename = basename($filename);
 
-        if (!str_ends_with(strtolower($filename), '.sql')) {
+        if (
+            !str_ends_with(
+                strtolower($filename),
+                '.sql'
+            )
+        ) {
             abort(404);
         }
 
-        $backupPath = storage_path('app/backup/' . $filename);
+        $backupPath = storage_path(
+            'app/backup/' . $filename
+        );
 
         if (!File::exists($backupPath)) {
             return redirect()
                 ->route('backups.index')
-                ->with('error', 'Backup file not found.');
+                ->with(
+                    'error',
+                    'Backup file not found.'
+                );
         }
 
         File::delete($backupPath);
 
+        /*
+        |--------------------------------------------------------------------------
+        | Delete corresponding log
+        |--------------------------------------------------------------------------
+        */
+
+        BackupLog::where(
+            'filename',
+            $filename
+        )->delete();
+
         return redirect()
             ->route('backups.index')
-            ->with('success', "Backup '{$filename}' deleted successfully.");
+            ->with(
+                'success',
+                "Backup '{$filename}' deleted successfully."
+            );
     }
 
     /**
-     * Format bytes into readable size.
+     * Bulk delete backups.
      */
-    private function formatFileSize(int $bytes): string
+    public function bulkDestroy(Request $request)
     {
+        $filenames = $request->input(
+            'filenames',
+            []
+        );
+
+        if (!is_array($filenames)) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'error',
+                    'Invalid backup selection.'
+                );
+        }
+
+        $deletedCount = 0;
+
+        $backupPath = storage_path(
+            'app/backup'
+        );
+
+        foreach ($filenames as $filename) {
+            $filename = basename($filename);
+
+            if (
+                !str_ends_with(
+                    strtolower($filename),
+                    '.sql'
+                )
+            ) {
+                continue;
+            }
+
+            $filePath = $backupPath .
+                DIRECTORY_SEPARATOR .
+                $filename;
+
+            if (File::exists($filePath)) {
+                File::delete($filePath);
+
+                BackupLog::where(
+                    'filename',
+                    $filename
+                )->delete();
+
+                $deletedCount++;
+            }
+        }
+
+        if ($deletedCount === 0) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'error',
+                    'No backups were deleted.'
+                );
+        }
+
+        return redirect()
+            ->route('backups.index')
+            ->with(
+                'success',
+                "{$deletedCount} backup(s) deleted successfully."
+            );
+    }
+
+    /**
+     * Verify a single backup checksum.
+     */
+    public function verify(string $filename)
+    {
+        $filename = basename($filename);
+
+        if (
+            !str_ends_with(
+                strtolower($filename),
+                '.sql'
+            )
+        ) {
+            abort(404);
+        }
+
+        $filePath = storage_path(
+            'app/backup/' . $filename
+        );
+
+        if (!File::exists($filePath)) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'error',
+                    'Backup file not found.'
+                );
+        }
+
+        if (File::size($filePath) === 0) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'error',
+                    'Backup file is empty.'
+                );
+        }
+
+        $actualChecksum = hash_file(
+            'sha256',
+            $filePath
+        );
+
+        $log = BackupLog::where(
+            'filename',
+            $filename
+        )
+            ->where(
+                'status',
+                'success'
+            )
+            ->latest()
+            ->first();
+
+        if (!$log) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'error',
+                    'No successful checksum record found for this backup.'
+                );
+        }
+
+        if (
+            hash_equals(
+                $log->checksum,
+                $actualChecksum
+            )
+        ) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'success',
+                    "Integrity verified successfully for '{$filename}'."
+                );
+        }
+
+        return redirect()
+            ->route('backups.index')
+            ->with(
+                'error',
+                "Integrity verification failed for '{$filename}'. The file may have been modified."
+            );
+    }
+
+    /**
+     * Manually remove old backups.
+     */
+    public function cleanup()
+    {
+        $backupPath = storage_path(
+            'app/backup'
+        );
+
+        if (!File::exists($backupPath)) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'error',
+                    'Backup directory does not exist.'
+                );
+        }
+
+        $retentionDays = max(
+            1,
+            (int) env(
+                'BACKUP_RETENTION_DAYS',
+                7
+            )
+        );
+
+        $cutoffTimestamp = now()
+            ->subDays($retentionDays)
+            ->timestamp;
+
+        $deletedCount = 0;
+
+        $files = File::files(
+            $backupPath
+        );
+
+        foreach ($files as $file) {
+            if (
+                strtolower(
+                    $file->getExtension()
+                ) !== 'sql'
+            ) {
+                continue;
+            }
+
+            if (
+                $file->getMTime()
+                <
+                $cutoffTimestamp
+            ) {
+                File::delete(
+                    $file->getPathname()
+                );
+
+                BackupLog::where(
+                    'filename',
+                    $file->getFilename()
+                )->delete();
+
+                $deletedCount++;
+            }
+        }
+
+        if ($deletedCount > 0) {
+            return redirect()
+                ->route('backups.index')
+                ->with(
+                    'success',
+                    "{$deletedCount} old backup(s) cleaned successfully."
+                );
+        }
+
+        return redirect()
+            ->route('backups.index')
+            ->with(
+                'success',
+                'No old backups needed to be removed.'
+            );
+    }
+
+    /**
+     * Export backup logs as CSV.
+     */
+    public function exportLogs(): StreamedResponse
+    {
+        $filename =
+            'backup-logs-' .
+            now()->format('Y-m-d-H-i-s') .
+            '.csv';
+
+        $logs = BackupLog::latest()->get();
+
+        return response()->streamDownload(
+            function () use ($logs) {
+
+                $handle = fopen(
+                    'php://output',
+                    'w'
+                );
+
+                fputcsv(
+                    $handle,
+                    [
+                        'ID',
+                        'Filename',
+                        'Status',
+                        'Size Bytes',
+                        'Checksum',
+                        'Message',
+                        'Created At',
+                    ]
+                );
+
+                foreach ($logs as $log) {
+                    fputcsv(
+                        $handle,
+                        [
+                            $log->id,
+                            $log->filename,
+                            $log->status,
+                            $log->size_bytes,
+                            $log->checksum,
+                            $log->message,
+                            optional(
+                                $log->created_at
+                            )->format(
+                                'Y-m-d H:i:s'
+                            ),
+                        ]
+                    );
+                }
+
+                fclose($handle);
+            },
+            $filename,
+            [
+                'Content-Type' =>
+                'text/csv; charset=UTF-8',
+            ]
+        );
+    }
+
+    /**
+     * Format bytes.
+     */
+    private function formatFileSize(
+        int $bytes
+    ): string {
         if ($bytes === 0) {
             return '0 Bytes';
         }
 
-        $units = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+        $units = [
+            'Bytes',
+            'KB',
+            'MB',
+            'GB',
+            'TB',
+        ];
 
-        $index = floor(log($bytes, 1024));
+        $index = floor(
+            log($bytes, 1024)
+        );
 
-        return round($bytes / pow(1024, $index), 2)
-            . ' '
-            . $units[$index];
+        return round(
+            $bytes /
+                pow(
+                    1024,
+                    $index
+                ),
+            2
+        ) .
+            ' ' .
+            $units[$index];
     }
 }
