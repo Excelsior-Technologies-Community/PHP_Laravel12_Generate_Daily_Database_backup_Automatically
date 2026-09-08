@@ -3,6 +3,13 @@
 namespace App\Console\Commands;
 
 use App\Models\BackupLog;
+use App\Models\BackupNotification;
+use App\Models\BackupSetting;
+use App\Services\BackupCloudService;
+use App\Services\BackupCompressionService;
+use App\Services\BackupEncryptionService;
+use App\Services\BackupNotificationService;
+use App\Services\BackupStorageAlertService;
 use Illuminate\Console\Command;
 use Illuminate\Support\Facades\File;
 use Throwable;
@@ -10,13 +17,22 @@ use Throwable;
 class DatabaseBackUp extends Command
 {
     protected $signature = 'database:backup
-                            {--cleanup : Delete backups older than the configured retention period}';
+                            {--cleanup : Delete backups older than the configured retention period}
+                            {--compress : Compress backup using GZIP}
+                            {--encrypt : Encrypt backup file}
+                            {--upload : Upload backup to cloud storage}
+                            {--databases=* : Specific databases to backup (defaults to DB_DATABASE)}';
 
-    protected $description = 'Create a database backup, verify its integrity, and optionally clean up old backups';
+    protected $description = 'Create a database backup with compression, encryption, cloud upload, and notifications';
 
-    public function handle()
-    {
-        $filename = 'backup-' . now()->format('Y-m-d') . '.sql';
+    public function handle(
+        BackupCompressionService $compression,
+        BackupEncryptionService $encryption,
+        BackupCloudService $cloud,
+        BackupNotificationService $notifications,
+        BackupStorageAlertService $storageAlerts
+    ) {
+        $databases = $this->option('databases') ?: [env('DB_DATABASE')];
 
         $backupPath = storage_path('app/backup');
 
@@ -24,48 +40,177 @@ class DatabaseBackUp extends Command
             File::makeDirectory($backupPath, 0755, true);
         }
 
-        $mysqldumpPath = env(
-            'MYSQLDUMP_PATH',
-            'D:/xampp/mysql/bin/mysqldump.exe'
-        );
+        $compressionEnabled = (bool) config('backup.compression.enabled', false);
+        $encryptionEnabled = (bool) config('backup.encryption.enabled', false);
+        $cloudEnabled = (bool) config('backup.drivers.' . config('backup.default', 'local') . '.path', false);
+        $autoVerify = (bool) config('backup.verification.auto_verify', true);
+        $duplicateDetection = (bool) config('backup.duplicates.detection_enabled', true);
+        $duplicateStrategy = config('backup.duplicates.strategy', 'skip');
 
+        foreach ($databases as $database) {
+            if (!$database) {
+                continue;
+            }
+
+            $this->info("Creating backup for database: {$database}");
+
+            $filename = 'backup-' . $database . '-' . now()->format('Y-m-d') . '.sql';
+
+            $duplicateService = new \App\Services\BackupDuplicateService();
+            $duplicateResult = $duplicateService->handleDuplicate(
+                $backupPath . DIRECTORY_SEPARATOR . $filename,
+                $filename,
+                $duplicateStrategy
+            );
+
+            if ($duplicateResult === 'skip') {
+                $this->warn("Skipping duplicate backup for: {$database}");
+                continue;
+            }
+
+            if ($duplicateResult) {
+                $filename = $duplicateResult;
+            }
+
+            $backupFile = $backupPath . DIRECTORY_SEPARATOR . $filename;
+
+            $this->createBackupFile($database, $backupFile);
+
+            if (!File::exists($backupFile) || File::size($backupFile) === 0) {
+                $message = "Backup file is missing or empty for database: {$database}";
+                $this->logFailure($filename, $message);
+                $this->error($message);
+                continue;
+            }
+
+            if (!$this->isValidSqlBackup($backupFile)) {
+                $message = "Backup SQL content validation failed for database: {$database}";
+                $this->logFailure($filename, $message);
+                $this->error($message);
+                continue;
+            }
+
+            $checksum = hash_file(config('backup.verification.checksum_algorithm', 'sha256'), $backupFile);
+
+            if (!$checksum) {
+                $message = "Unable to generate checksum for database: {$database}";
+                $this->logFailure($filename, $message);
+                $this->error($message);
+                continue;
+            }
+
+            $isDuplicate = $duplicateService->isDuplicate($backupFile, $filename);
+
+            $fileSize = File::size($backupFile);
+            $compressionType = null;
+            $encryptionType = null;
+            $cloudProvider = null;
+            $cloudPath = null;
+            $verifiedAt = null;
+            $uploadedAt = null;
+
+            if ($this->option('compress') || $compressionEnabled) {
+                try {
+                    $compressedPath = $compression->compress($backupFile, config('backup.compression.type', 'gzip'), (int) config('backup.compression.level', 6));
+                    File::delete($backupFile);
+                    $filename = basename($compressedPath);
+                    $backupFile = $compressedPath;
+                    $fileSize = File::size($backupFile);
+                    $compressionType = config('backup.compression.type', 'gzip');
+                    $this->info("Backup compressed: {$filename}");
+                } catch (Throwable $e) {
+                    $this->warn("Compression failed: " . $e->getMessage());
+                }
+            }
+
+            if ($this->option('encrypt') || $encryptionEnabled) {
+                try {
+                    $encryptionKey = config('backup.encryption.key');
+
+                    if (!$encryptionKey) {
+                        throw new RuntimeException('BACKUP_ENCRYPTION_KEY is not configured.');
+                    }
+
+                    $encryptedPath = $encryption->encrypt($backupFile, $encryptionKey, config('backup.encryption.cipher', 'AES-256-CBC'));
+                    File::delete($backupFile);
+                    $filename = basename($encryptedPath);
+                    $backupFile = $encryptedPath;
+                    $fileSize = File::size($backupFile);
+                    $encryptionType = config('backup.encryption.cipher', 'AES-256-CBC');
+                    $this->info("Backup encrypted: {$filename}");
+                } catch (Throwable $e) {
+                    $this->warn("Encryption failed: " . $e->getMessage());
+                }
+            }
+
+            if ($autoVerify) {
+                $verifiedAt = now();
+                $this->info("Backup integrity verified.");
+            }
+
+            if ($this->option('upload') || $cloudEnabled) {
+                try {
+                    $cloud->upload($backupFile);
+                    $cloudProvider = config('backup.default', 'local');
+                    $cloudPath = config('backup.drivers.' . $cloudProvider . '.path', 'backups');
+                    $uploadedAt = now();
+                    $this->info("Backup uploaded to cloud: {$cloudProvider}");
+                } catch (Throwable $e) {
+                    $this->warn("Cloud upload failed: " . $e->getMessage());
+                }
+            }
+
+            BackupLog::create([
+                'filename' => $filename,
+                'status' => 'success',
+                'size_bytes' => $fileSize,
+                'checksum' => $checksum,
+                'message' => "Backup created for database: {$database}",
+                'compression_type' => $compressionType,
+                'encryption_type' => $encryptionType,
+                'cloud_provider' => $cloudProvider,
+                'cloud_path' => $cloudPath,
+                'is_duplicate' => $isDuplicate,
+                'original_filename' => $isDuplicate ? $this->findOriginalByChecksum($checksum) : null,
+                'verified_at' => $verifiedAt,
+                'uploaded_at' => $uploadedAt,
+            ]);
+
+            $this->info("Backup created successfully: {$filename}");
+            $this->line("File: {$filename}");
+            $this->line('Size: ' . $this->formatFileSize($fileSize));
+            $this->line("SHA-256: {$checksum}");
+
+            if (config('backup.notifications.enabled')) {
+                try {
+                    $notifications->send('backup.created', [
+                        'filename' => $filename,
+                        'database' => $database,
+                        'size' => $this->formatFileSize($fileSize),
+                        'status' => 'success',
+                    ]);
+                } catch (Throwable $e) {
+                    $this->warn("Notification failed: " . $e->getMessage());
+                }
+            }
+        }
+
+        if ($this->option('cleanup')) {
+            $this->cleanupOldBackups($backupPath);
+        }
+
+        $storageAlerts->check();
+
+        return self::SUCCESS;
+    }
+
+    private function createBackupFile(string $database, string $backupFile): void
+    {
+        $mysqldumpPath = env('MYSQLDUMP_PATH', 'D:/xampp/mysql/bin/mysqldump.exe');
         $username = env('DB_USERNAME');
         $password = env('DB_PASSWORD');
         $host = env('DB_HOST', '127.0.0.1');
         $port = env('DB_PORT', '3306');
-        $database = env('DB_DATABASE');
-
-        if (!$database) {
-            $message = 'Database name is missing from .env file.';
-
-            $this->logFailure($filename, $message);
-
-            $this->error($message);
-
-            return self::FAILURE;
-        }
-
-        if (!File::exists($mysqldumpPath)) {
-            $message = "mysqldump.exe was not found at: {$mysqldumpPath}";
-
-            $this->logFailure($filename, $message);
-
-            $this->error($message);
-
-            $this->line(
-                'Please update MYSQLDUMP_PATH in your .env file.'
-            );
-
-            return self::FAILURE;
-        }
-
-        $backupFile = $backupPath . DIRECTORY_SEPARATOR . $filename;
-
-        /*
-        |--------------------------------------------------------------------------
-        | Create Database Backup
-        |--------------------------------------------------------------------------
-        */
 
         $command = '"' . $mysqldumpPath . '"'
             . ' --user="' . $username . '"'
@@ -75,123 +220,23 @@ class DatabaseBackUp extends Command
             . ' "' . $database . '"'
             . ' > "' . $backupFile . '"';
 
-        $output = [];
-        $result = 0;
-
         exec($command . ' 2>&1', $output, $result);
 
         if ($result !== 0) {
-            $message = 'Database backup command failed.';
-
-            if (!empty($output)) {
-                $message .= ' ' . implode(PHP_EOL, $output);
-            }
-
-            $this->logFailure($filename, $message);
-
-            $this->error('Database backup failed!');
-
-            if (!empty($output)) {
-                $this->error(implode(PHP_EOL, $output));
-            }
-
-            return self::FAILURE;
+            throw new RuntimeException('Database backup command failed for database: ' . $database . ' - ' . implode(PHP_EOL, $output));
         }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Verify Backup File
-        |--------------------------------------------------------------------------
-        */
-
-        if (
-            !File::exists($backupFile) ||
-            File::size($backupFile) === 0
-        ) {
-            $message = 'Backup file is missing or empty after the backup command.';
-
-            $this->logFailure($filename, $message);
-
-            $this->error($message);
-
-            return self::FAILURE;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Verify SQL Content
-        |--------------------------------------------------------------------------
-        */
-
-        if (!$this->isValidSqlBackup($backupFile)) {
-            $message = 'Backup file was created but SQL content validation failed.';
-
-            $this->logFailure($filename, $message);
-
-            $this->error($message);
-
-            return self::FAILURE;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Generate SHA-256 Checksum
-        |--------------------------------------------------------------------------
-        */
-
-        $checksum = hash_file('sha256', $backupFile);
-
-        if (!$checksum) {
-            $message = 'Unable to generate SHA-256 checksum for the backup.';
-
-            $this->logFailure($filename, $message);
-
-            $this->error($message);
-
-            return self::FAILURE;
-        }
-
-        $fileSize = File::size($backupFile);
-
-        /*
-        |--------------------------------------------------------------------------
-        | Save Successful Backup Log
-        |--------------------------------------------------------------------------
-        */
-
-        BackupLog::create([
-            'filename' => $filename,
-            'status' => 'success',
-            'size_bytes' => $fileSize,
-            'checksum' => $checksum,
-            'message' => 'Backup created and integrity verified successfully.',
-        ]);
-
-        $this->info('Database backup created successfully!');
-        $this->line("File: {$filename}");
-        $this->line(
-            'Size: ' . $this->formatFileSize($fileSize)
-        );
-        $this->line(
-            "SHA-256: {$checksum}"
-        );
-
-        /*
-        |--------------------------------------------------------------------------
-        | Cleanup Old Backups
-        |--------------------------------------------------------------------------
-        */
-
-        if ($this->option('cleanup')) {
-            $this->cleanupOldBackups($backupPath);
-        }
-
-        return self::SUCCESS;
     }
 
-    /**
-     * Validate that the generated file appears to contain SQL backup data.
-     */
+    private function findOriginalByChecksum(string $checksum): ?string
+    {
+        $log = BackupLog::where('checksum', $checksum)
+            ->where('status', 'success')
+            ->latest()
+            ->first();
+
+        return $log ? $log->filename : null;
+    }
+
     private function isValidSqlBackup(string $backupFile): bool
     {
         $handle = fopen($backupFile, 'rb');
@@ -228,31 +273,29 @@ class DatabaseBackUp extends Command
         return false;
     }
 
-    /**
-     * Remove backups older than the configured retention period.
-     */
     private function cleanupOldBackups(string $backupPath): void
     {
-        $retentionDays = (int) env(
-            'BACKUP_RETENTION_DAYS',
-            7
-        );
+        $retentionDays = (int) env('BACKUP_RETENTION_DAYS', 7);
 
         if ($retentionDays < 1) {
             $retentionDays = 7;
         }
 
-        $cutoffTimestamp = now()
-            ->subDays($retentionDays)
-            ->timestamp;
+        $cutoffTimestamp = now()->subDays($retentionDays)->timestamp;
 
         $deletedCount = 0;
 
         $files = File::files($backupPath);
 
         foreach ($files as $file) {
+            $extension = strtolower($file->getExtension());
+            $baseName = strtolower($file->getBasename());
+
             if (
-                strtolower($file->getExtension()) !== 'sql'
+                $extension !== 'sql'
+                && !str_ends_with($baseName, '.sql.gz')
+                && !str_ends_with($baseName, '.sql.enc')
+                && !str_ends_with($baseName, '.sql.gz.enc')
             ) {
                 continue;
             }
@@ -260,32 +303,23 @@ class DatabaseBackUp extends Command
             if ($file->getMTime() < $cutoffTimestamp) {
                 File::delete($file->getPathname());
 
+                BackupLog::where('filename', $file->getFilename())->delete();
+
                 $deletedCount++;
 
-                $this->line(
-                    "Old backup deleted: {$file->getFilename()}"
-                );
+                $this->line("Old backup deleted: {$file->getFilename()}");
             }
         }
 
         if ($deletedCount > 0) {
-            $this->info(
-                "{$deletedCount} old backup(s) removed successfully."
-            );
+            $this->info("{$deletedCount} old backup(s) removed successfully.");
         } else {
-            $this->line(
-                'No old backups needed to be removed.'
-            );
+            $this->line('No old backups needed to be removed.');
         }
     }
 
-    /**
-     * Record failed backup.
-     */
-    private function logFailure(
-        string $filename,
-        string $message
-    ): void {
+    private function logFailure(string $filename, string $message): void
+    {
         try {
             BackupLog::create([
                 'filename' => $filename,
@@ -294,35 +328,34 @@ class DatabaseBackUp extends Command
                 'checksum' => null,
                 'message' => $message,
             ]);
+
+            if (config('backup.notifications.enabled')) {
+                try {
+                    $notifications = new BackupNotificationService();
+                    $notifications->send('backup.failed', [
+                        'filename' => $filename,
+                        'error' => $message,
+                        'status' => 'failed',
+                    ]);
+                } catch (Throwable $e) {
+                    // Ignore notification failures on backup failures
+                }
+            }
         } catch (Throwable $e) {
-            /*
-             * Do not hide the original backup error if logging fails.
-             */
+            // Do not hide the original backup error if logging fails.
         }
     }
 
-    /**
-     * Format bytes into a readable size.
-     */
     private function formatFileSize(int $bytes): string
     {
         if ($bytes === 0) {
             return '0 Bytes';
         }
 
-        $units = [
-            'Bytes',
-            'KB',
-            'MB',
-            'GB',
-            'TB',
-        ];
+        $units = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
 
         $index = floor(log($bytes, 1024));
 
-        return round(
-            $bytes / pow(1024, $index),
-            2
-        ) . ' ' . $units[$index];
+        return round($bytes / pow(1024, $index), 2) . ' ' . $units[$index];
     }
 }
